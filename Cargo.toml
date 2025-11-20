@@ -18,6 +18,12 @@ thiserror = "1.0"
 x-base = "0.1"
 x-media = "0.1"
 x-variant = "0.1"
+smallvec = "1.15.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+#libcamera 0.4.0 doesn't contain all the APIs required, we need to use a newer version from git
+#libcamera = { version = "0.4.0" }
+libcamera = { git = "https://github.com/lit-robotics/libcamera-rs.git", rev = "764c498c0eb69f3cca1954dd306408841b7171ad"}
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 av-foundation = "0.5"
