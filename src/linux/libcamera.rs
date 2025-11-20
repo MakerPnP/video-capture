@@ -1,8 +1,8 @@
-use std::{
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, thread, time::{SystemTime, UNIX_EPOCH}};
 use std::num::NonZeroU32;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 use libcamera::{
     camera::ActiveCamera,
     camera_manager::CameraManager,
@@ -29,39 +29,306 @@ const FOURCC_MJPEG: u32 = u32::from_le_bytes([b'M', b'J', b'P', b'G']);
 const FOURCC_NV12: u32 = u32::from_le_bytes([b'N', b'V', b'1', b'2']);
 const FOURCC_YUYV: u32 = u32::from_le_bytes([b'Y', b'U', b'Y', b'V']);
 
+type OutputHanderFn = dyn Fn(MediaFrame) -> Result<(), DeviceError> + Send + Sync;
+type OutputHandlerArc = Arc<OutputHanderFn>;
 
-/// Linux backend device
-pub struct LinuxCameraDevice<'a> {
-    id: String,
-    camera: ActiveCamera<'a>,
+struct LinuxCameraWorker {
+    camera: ActiveCamera<'static>,
     alloc: FrameBufferAllocator,
-    running: bool,
-    output_handler: Option<Arc<dyn Fn(MediaFrame) -> Result<(), DeviceError> + Send + Sync>>,
+    output_handler: Option<OutputHandlerArc>,
     config: Option<CameraConfiguration>,
+    cmd_rx: mpsc::Receiver<CameraCmd>,
+    cmd_response_tx: mpsc::Sender<CameraCmdResponse>,
 }
 
-impl<'a> LinuxCameraDevice<'a> {
-    pub fn new(
-        camera: ActiveCamera<'a>
-    ) -> Self {
+// Safety: the `ActiveCamera` is only used by the worker thread
+unsafe impl Send for LinuxCameraWorker {}
 
-        let config = camera.generate_configuration(&[StreamRole::VideoRecording]).unwrap();
+impl LinuxCameraWorker {
+    fn run(mut instance: LinuxCameraWorker) {
 
-        let alloc = FrameBufferAllocator::new(&camera);
+        let mut req_rx = None;
+        let mut running = false;
+        let mut shutdown = false;
 
-        let id = camera.id().to_string();
-        Self {
-            id,
-            camera,
-            config: Some(config),
-            alloc,
-            running: false,
-            output_handler: None,
+        while !shutdown {
+            // process all outstanding commands
+            while let Ok(cmd) = instance.cmd_rx.try_recv() {
+                if shutdown {
+                    break;
+                }
+
+                match cmd {
+                    CameraCmd::Start => {
+                        if running {
+                            let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed("Already running".into())));
+                            continue
+                        }
+
+                        let handler = instance.output_handler.clone();
+                        let stream_cfg = instance.config
+                            .as_mut().unwrap()
+                            .get_mut(0).unwrap();
+
+                        let stream = stream_cfg.stream().unwrap();
+
+                        let size = stream_cfg.get_size();
+                        let format: libcamera::pixel_format::PixelFormat = stream_cfg.get_pixel_format();
+                        let pixel_format = match format.fourcc() {
+                            FOURCC_NV12 => crate::media::video::PixelFormat::NV12,
+                            FOURCC_YUYV => crate::media::video::PixelFormat::YUYV,
+                            _ => {
+                                let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed(format!("Unsupported pixel format. {:?}", format).into())));
+                                continue;
+                            },
+                        };
+
+                        let desc = VideoFrameDescription::new(
+                            pixel_format,
+                            unsafe { NonZeroU32::new_unchecked(size.width) },
+                            unsafe { NonZeroU32::new_unchecked(size.height) },
+                        );
+
+                        let (req_tx, new_req_rx) = mpsc::channel::<libcamera::request::Request>();
+                        req_rx = Some(new_req_rx);
+
+                        if let Some(handler) = handler {
+                            // Set callback for completed requests
+                            instance.camera.on_request_completed({
+                                let desc = desc.clone();
+                                move |req| {
+                                    if let Some(framebuffer) = req.buffer::<MemoryMappedFrameBuffer<FrameBuffer>>(&stream) {
+                                        if let Some(plane) = framebuffer.data().get(0) {
+                                            let bytes_used = framebuffer.planes().get(0).unwrap().len() as usize;
+                                            let data = plane[..bytes_used].to_vec();
+
+                                            let timestamp = SystemTime::now()
+                                                .duration_since(UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_micros() as u64;
+
+                                            let mut frame = MediaFrame::from_data_buffer(desc.clone(), data.as_slice()).unwrap();
+                                            frame.timestamp = timestamp;
+
+                                            let _ = handler(frame);
+                                        }
+                                    }
+
+                                    // Reuse and requeue
+                                    req_tx.send(req).unwrap();
+                                }
+                            });
+                        }
+
+                        let buffers = instance.alloc
+                            .alloc(&stream)
+                            .unwrap()
+                            .into_iter()
+                            .map(|b| MemoryMappedFrameBuffer::new(b).unwrap())
+                            .collect::<Vec<_>>();
+
+                        let reqs = buffers
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, buf)| {
+                                let mut req = instance.camera.create_request(Some(i as u64)).unwrap();
+                                req.add_buffer(&stream, buf).unwrap();
+                                req
+                            })
+                            .collect::<Vec<_>>();
+
+                        if let Err(e) = instance.camera.start(None) {
+                            let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed(format!("{e:?}"))));
+                            continue;
+                        };
+
+                        // Enqueue all requests to the camera
+                        for req in reqs {
+                            println!("Request queued for execution: {req:#?}");
+                            instance.camera.queue_request(req).unwrap();
+                        }
+
+                        let _ = instance.cmd_response_tx.send(CameraCmdResponse::Ok);
+                        running = true;
+                    }
+                    CameraCmd::Stop => {
+                        if !running {
+                            let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::NotRunning("Not running".to_string())));
+                            continue;
+                        }
+
+                        if let Err(e) = instance.camera.stop() {
+                            let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StopFailed(format!("{e:?}"))));
+                        }
+                        running = false;
+                    }
+                    CameraCmd::Shutdown => {
+                        shutdown = true;
+                        break
+                    }
+                    CameraCmd::SetOutputHandler(handler) => {
+                        instance.output_handler = Some(handler);
+                        let _ = instance.cmd_response_tx.send(CameraCmdResponse::Ok);
+                    }
+                    CameraCmd::Configure(options) => {
+                        let mut stream_config = instance.config
+                            .as_mut().unwrap()
+                            .get_mut(0).unwrap();
+
+                        // TODO match the options against a valid format for this device, since the supplied values may be wrong or result in an invalid combination.
+                        let desired_size = if let (Some(width), Some(height)) = (options["width"].get_uint32(), options["height"].get_uint32()) {
+                            Some(libcamera::geometry::Size { width, height })
+                        } else {
+                            None
+                        };
+
+                        if let Some(desired_size) = desired_size {
+                            println!("desired size: {:?}", desired_size);
+                            stream_config.set_size(desired_size);
+                        }
+
+                        let video_format = options["format"].get_uint32();
+
+                        let video_format = match video_format {
+                            Some(video_format) => media::video::VideoFormat::try_from(video_format).ok(),
+                            None => None,
+                        };
+
+                        println!("video format: {:?}", video_format);
+
+                        match video_format {
+                            Some(VideoFormat::Pixel(PixelFormat::NV12)) => stream_config.set_pixel_format(PIXEL_FORMAT_NV12),
+                            Some(VideoFormat::Pixel(PixelFormat::YUYV)) => stream_config.set_pixel_format(PIXEL_FORMAT_YUYV),
+                            Some(VideoFormat::Compression(CompressionFormat::MJPEG)) => stream_config.set_pixel_format(PIXEL_FORMAT_MJPEG),
+                            Some(_) => {
+                                // TODO: handle other formats
+                                unimplemented!()
+                            },
+                            None => {
+                                // XXX temporarily use YUYV as default format
+                                stream_config.set_pixel_format(PIXEL_FORMAT_YUYV)
+                            }
+                        };
+
+                        let frame_rate = options["frame-rate"].get_float();
+                        if let Some(frame_rate) = frame_rate {
+                            // TODO
+                        }
+
+                        // drop the reference to avoid borrow checker issues
+                        drop(stream_config);
+
+                        // avoid borrow checker issues by taking the config
+                        let configuration_result = {
+                            let mut config = instance.config.take().unwrap();
+                            config.validate();
+                            let result = instance.camera.configure(&mut config);
+
+                            // XXX
+                            println!("config: {:?}", config);
+
+                            instance.config.replace(config);
+                            result
+                        };
+                        if let Err(e) = configuration_result {
+                            if instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::SetFailed(format!("{e:?}")))).is_err() {
+                                shutdown = true;
+                            }
+                            break
+                        }
+
+
+                        if let Some(desired_size) = desired_size {
+                            let stream_config = instance.config
+                                .as_mut().unwrap()
+                                .get_mut(0).unwrap();
+                            let actual_size = stream_config.get_size();
+                            assert_eq!((desired_size.width, desired_size.height), (actual_size.width, actual_size.height));
+                        }
+                        if instance.cmd_response_tx.send(CameraCmdResponse::Ok).is_err() {
+                            break
+                        }
+                    }
+                }
+            }
+            if let Some(req_rx) = req_rx.as_mut() {
+                if let Ok(mut req) = req_rx.recv_timeout(Duration::from_millis(250)) {
+                    if running {
+                        req.reuse(ReuseFlag::REUSE_BUFFERS);
+                        if let Err(e) = instance.camera.queue_request(req) {
+                            eprintln!("queue_request failed: {:?}", e);
+                            break;
+                        }
+                    } else {
+                        drop(req);
+                    }
+                }
+            }
         }
     }
 }
 
-impl<'a> Device for LinuxCameraDevice<'a> {
+enum CameraCmd
+{
+    Start,
+    Stop,
+    Shutdown,
+    SetOutputHandler(OutputHandlerArc),
+    Configure(Variant),
+}
+
+enum CameraCmdResponse {
+    Ok,
+    DeviceError(DeviceError),
+}
+
+struct LinuxCameraWorkerHandle {
+    join: JoinHandle<()>,
+}
+
+/// Linux backend device
+pub struct LinuxCameraDevice {
+    id: String,
+    running: bool,
+    worker_handle: LinuxCameraWorkerHandle,
+    cmd_tx: mpsc::Sender<CameraCmd>,
+    cmd_response_rx: mpsc::Receiver<CameraCmdResponse>,
+}
+
+impl LinuxCameraDevice {
+    pub fn new(
+        camera: ActiveCamera<'static>
+    ) -> Self {
+        let id = camera.id().to_string();
+
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CameraCmd>();
+        let (cmd_response_tx, cmd_response_rx) = std::sync::mpsc::channel::<CameraCmdResponse>();
+
+        let config = camera.generate_configuration(&[StreamRole::VideoRecording]).unwrap();
+        let alloc = FrameBufferAllocator::new(&camera);
+
+        let worker = LinuxCameraWorker {
+            camera,
+            config: Some(config),
+            alloc,
+            output_handler: None,
+            cmd_rx,
+            cmd_response_tx,
+        };
+
+        let worker_join_handle = thread::spawn(move || { LinuxCameraWorker::run(worker)});
+
+        Self {
+            id,
+            running: false,
+            worker_handle: LinuxCameraWorkerHandle { join: worker_join_handle },
+            cmd_tx,
+            cmd_response_rx,
+        }
+    }
+}
+
+impl Device for LinuxCameraDevice {
     fn name(&self) -> &str {
         //self.camera.properties().get::<Model>().unwrap()
         "TODO"
@@ -72,171 +339,30 @@ impl<'a> Device for LinuxCameraDevice<'a> {
     }
 
     fn start(&mut self) -> Result<(), DeviceError> {
-        let handler = self.output_handler.clone();
-        let stream_cfg = self.config
-            .as_mut().unwrap()
-            .get_mut(0).unwrap();
-
-        let stream = stream_cfg.stream().unwrap();
-
-        let size = stream_cfg.get_size();
-        let format: libcamera::pixel_format::PixelFormat = stream_cfg.get_pixel_format();
-        let pixel_format = match format.fourcc() {
-            FOURCC_NV12 => crate::media::video::PixelFormat::NV12,
-            FOURCC_YUYV => crate::media::video::PixelFormat::YUYV,
-            _ => return Err(DeviceError::StartFailed(format!("Unsupported pixel format. {:?}", format).into())),
-        };
-
-        let desc = VideoFrameDescription::new(
-            pixel_format,
-            unsafe { NonZeroU32::new_unchecked(size.width) },
-            unsafe { NonZeroU32::new_unchecked(size.height) },
-        );
-
-        let (tx, rx) = std::sync::mpsc::channel();
-
-        if let Some(handler) = handler {
-            // Set callback for completed requests
-            self.camera.on_request_completed({
-                let desc = desc.clone();
-                move |req| {
-                    if let Some(framebuffer) = req.buffer::<MemoryMappedFrameBuffer<FrameBuffer>>(&stream) {
-                        if let Some(plane) = framebuffer.data().get(0) {
-                            let bytes_used = framebuffer.planes().get(0).unwrap().len() as usize;
-                            let data = plane[..bytes_used].to_vec();
-
-                            let timestamp = SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .unwrap()
-                                .as_micros() as u64;
-
-                            let mut frame = MediaFrame::from_data_buffer(desc.clone(), data.as_slice()).unwrap();
-                            frame.timestamp = timestamp;
-
-                            let _ = handler(frame);
-                        }
-                    }
-
-                    // Reuse and requeue
-                    tx.send(req).unwrap();
-                }
-            });
+        self.cmd_tx.send(CameraCmd::Start)
+            .map_err(|e| DeviceError::StartFailed(format!("Failed to send start command: {:?}", e)))?;
+        match self.cmd_response_rx.recv()
+            .map_err(|e| DeviceError::StartFailed(format!("No response to command: {:?}", e)))?
+        {
+            CameraCmdResponse::Ok => Ok(()),
+            CameraCmdResponse::DeviceError(e) => Err(e),
         }
-
-        let buffers = self.alloc
-            .alloc(&stream)
-            .unwrap()
-            .into_iter()
-            .map(|b| MemoryMappedFrameBuffer::new(b).unwrap())
-            .collect::<Vec<_>>();
-
-        let reqs = buffers
-            .into_iter()
-            .enumerate()
-            .map(|(i, buf)| {
-                let mut req = self.camera.create_request(Some(i as u64)).unwrap();
-                req.add_buffer(&stream, buf).unwrap();
-                req
-            })
-            .collect::<Vec<_>>();
-
-        self.camera.start(None).map_err(|e| DeviceError::StartFailed(format!("{e:?}")))?;
-        self.running = true;
-
-        // Enqueue all requests to the camera
-        for req in reqs {
-            println!("Request queued for execution: {req:#?}");
-            self.camera.queue_request(req).unwrap();
-        }
-
-        // TODO this needs to run on the same thread that owns the camera, not in here.
-        //      but this method is supposed to be non-blocking...
-        loop {
-            let mut req = rx.recv().expect("Camera request failed");
-            req.reuse(ReuseFlag::REUSE_BUFFERS);
-            self.camera.queue_request(req).unwrap();
-        }
-
-        Ok(())
     }
 
     fn stop(&mut self) -> Result<(), DeviceError> {
-        self.camera.stop().map_err(|e| DeviceError::StopFailed(format!("{e:?}")))?;
-        self.running = false;
+        // TODO send stop command
         Ok(())
     }
 
     fn configure(&mut self, options: Variant) -> Result<(), DeviceError> {
-        let mut stream_config = self.config
-            .as_mut().unwrap()
-            .get_mut(0).unwrap();
-
-        // TODO match the options against a valid format for this device, since the supplied values may be wrong or result in an invalid combination.
-        let desired_size = if let (Some(width), Some(height)) = (options["width"].get_uint32(), options["height"].get_uint32()) {
-            Some(libcamera::geometry::Size { width, height })
-        } else {
-            None
-        };
-
-        if let Some(desired_size) = desired_size {
-            println!("desired size: {:?}", desired_size);
-            stream_config.set_size(desired_size);
-        }
-
-        let video_format = options["format"].get_uint32();
-
-        let video_format = match video_format {
-            Some(video_format) => media::video::VideoFormat::try_from(video_format).ok(),
-            None => None,
-        };
-
-        println!("video format: {:?}", video_format);
-
-        match video_format {
-            Some(VideoFormat::Pixel(PixelFormat::NV12)) => stream_config.set_pixel_format(PIXEL_FORMAT_NV12),
-            Some(VideoFormat::Pixel(PixelFormat::YUYV)) => stream_config.set_pixel_format(PIXEL_FORMAT_YUYV),
-            Some(VideoFormat::Compression(CompressionFormat::MJPEG)) => stream_config.set_pixel_format(PIXEL_FORMAT_MJPEG),
-            Some(_) => {
-                // TODO: handle other formats
-                unimplemented!()
-            },
-            None => {
-                // XXX temporarily use YUYV as default format
-                stream_config.set_pixel_format(PIXEL_FORMAT_YUYV)
-            }
-        };
-
-        let frame_rate = options["frame-rate"].get_float();
-        if let Some(frame_rate) = frame_rate {
-            // TODO
-        }
-
-        // drop the reference to avoid borrow checker issues
-        drop(stream_config);
-
-        // avoid borrow checker issues by taking the config
+        self.cmd_tx.send(CameraCmd::Configure(options))
+            .map_err(|e| DeviceError::SetFailed(format!("Failed to send configure command: {:?}", e)))?;
+        match self.cmd_response_rx.recv()
+            .map_err(|e| DeviceError::SetFailed(format!("No response to command: {:?}", e)))?
         {
-            let mut config = self.config.take().unwrap();
-            config.validate();
-            let result = self.camera.configure(&mut config);
-
-            // XXX
-            println!("config: {:?}", config);
-
-            self.config.replace(config);
-            result
+            CameraCmdResponse::Ok => Ok(()),
+            CameraCmdResponse::DeviceError(e) => Err(e),
         }
-            .map_err(|e| DeviceError::SetFailed(format!("{e:?}")))?;
-
-
-        if let Some(desired_size) = desired_size {
-            let stream_config = self.config
-                .as_mut().unwrap()
-                .get_mut(0).unwrap();
-            let actual_size = stream_config.get_size();
-            assert_eq!((desired_size.width, desired_size.height), (actual_size.width, actual_size.height));
-        }
-        Ok(())
     }
 
     fn control(&mut self, _action: Variant) -> Result<(), DeviceError> {
@@ -254,25 +380,31 @@ impl<'a> Device for LinuxCameraDevice<'a> {
     }
 }
 
-impl<'a> OutputDevice for LinuxCameraDevice<'a> {
+impl<'a> OutputDevice for LinuxCameraDevice {
     fn set_output_handler<F>(&mut self, handler: F) -> Result<(), DeviceError>
     where
         F: Fn(MediaFrame) -> Result<(), DeviceError> + Send + Sync + 'static,
     {
-        self.output_handler = Some(Arc::new(handler));
-        Ok(())
+        self.cmd_tx.send(CameraCmd::SetOutputHandler(Arc::new(handler)))
+            .map_err(|e| DeviceError::SetFailed(format!("Failed to send set output handler command: {:?}", e)))?;
+        match self.cmd_response_rx.recv()
+            .map_err(|e| DeviceError::SetFailed(format!("No response to command: {:?}", e)))?
+        {
+            CameraCmdResponse::Ok => Ok(()),
+            CameraCmdResponse::DeviceError(e) => Err(e),
+        }
     }
 }
 
 /// Linux backend device manager
 pub struct LinuxCameraManager {
     mgr: CameraManager,
-    devices: Vec<LinuxCameraDevice<'static>>,
+    devices: Vec<LinuxCameraDevice>,
     change_handler: Option<Arc<dyn Fn(&DeviceEvent) + Send + Sync>>,
 }
 
 impl DeviceManager for LinuxCameraManager {
-    type DeviceType = LinuxCameraDevice<'static>;
+    type DeviceType = LinuxCameraDevice;
 
     fn init() -> Result<Self, DeviceError> {
         let mgr = CameraManager::new()
