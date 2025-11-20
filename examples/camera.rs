@@ -1,3 +1,4 @@
+use x_media::video::{PixelFormat, VideoFormat};
 use video_capture::{
     camera::CameraManager,
     device::{Device, OutputDevice},
@@ -64,6 +65,8 @@ fn main() {
     option["width"] = 1280.into();
     option["height"] = 720.into();
     option["frame-rate"] = 30.0.into();
+    option["format"] = Variant::UInt32(VideoFormat::Pixel(PixelFormat::YUYV).into());
+
     if let Err(e) = device.configure(option) {
         println!("{:?}", e.to_string());
     }

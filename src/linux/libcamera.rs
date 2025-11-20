@@ -22,6 +22,14 @@ use crate::{
     variant::Variant,
 };
 
+const PIXEL_FORMAT_MJPEG: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_MJPEG, 0);
+const PIXEL_FORMAT_NV12: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_NV12, 0);
+const PIXEL_FORMAT_YUYV: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_YUYV, 0);
+const FOURCC_MJPEG: u32 = u32::from_le_bytes([b'M', b'J', b'P', b'G']);
+const FOURCC_NV12: u32 = u32::from_le_bytes([b'N', b'V', b'1', b'2']);
+const FOURCC_YUYV: u32 = u32::from_le_bytes([b'Y', b'U', b'Y', b'V']);
+
+
 /// Linux backend device
 pub struct LinuxCameraDevice<'a> {
     id: String,
@@ -72,10 +80,16 @@ impl<'a> Device for LinuxCameraDevice<'a> {
         let stream = stream_cfg.stream().unwrap();
 
         let size = stream_cfg.get_size();
+        let format: libcamera::pixel_format::PixelFormat = stream_cfg.get_pixel_format();
+        let pixel_format = match format.fourcc() {
+            FOURCC_NV12 => crate::media::video::PixelFormat::NV12,
+            FOURCC_YUYV => crate::media::video::PixelFormat::YUYV,
+            _ => return Err(DeviceError::StartFailed(format!("Unsupported pixel format. {:?}", format).into())),
+        };
 
         let desc = VideoFrameDescription::new(
-            crate::media::video::PixelFormat::NV12,
-            unsafe { NonZeroU32::new_unchecked(size.height) },
+            pixel_format,
+            unsafe { NonZeroU32::new_unchecked(size.width) },
             unsafe { NonZeroU32::new_unchecked(size.height) },
         );
 
@@ -135,7 +149,7 @@ impl<'a> Device for LinuxCameraDevice<'a> {
             self.camera.queue_request(req).unwrap();
         }
 
-        // TODO something on the same thread that owns the camera needs to process `rx`.
+        // TODO this needs to run on the same thread that owns the camera, not in here.
         //      but this method is supposed to be non-blocking...
         loop {
             let mut req = rx.recv().expect("Camera request failed");
@@ -153,10 +167,6 @@ impl<'a> Device for LinuxCameraDevice<'a> {
     }
 
     fn configure(&mut self, options: Variant) -> Result<(), DeviceError> {
-        const PIXEL_FORMAT_MJPEG: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(u32::from_le_bytes([b'M', b'J', b'P', b'G']), 0);
-        const PIXEL_FORMAT_NV12: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(u32::from_le_bytes([b'N', b'V', b'1', b'2']), 0);
-        const PIXEL_FORMAT_YUYV: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(u32::from_le_bytes([b'Y', b'U', b'Y', b'V']), 0);
-
         let mut stream_config = self.config
             .as_mut().unwrap()
             .get_mut(0).unwrap();
@@ -169,6 +179,7 @@ impl<'a> Device for LinuxCameraDevice<'a> {
         };
 
         if let Some(desired_size) = desired_size {
+            println!("desired size: {:?}", desired_size);
             stream_config.set_size(desired_size);
         }
 
@@ -179,6 +190,8 @@ impl<'a> Device for LinuxCameraDevice<'a> {
             None => None,
         };
 
+        println!("video format: {:?}", video_format);
+
         match video_format {
             Some(VideoFormat::Pixel(PixelFormat::NV12)) => stream_config.set_pixel_format(PIXEL_FORMAT_NV12),
             Some(VideoFormat::Pixel(PixelFormat::YUYV)) => stream_config.set_pixel_format(PIXEL_FORMAT_YUYV),
@@ -188,8 +201,8 @@ impl<'a> Device for LinuxCameraDevice<'a> {
                 unimplemented!()
             },
             None => {
-                // XXX temporarily use NV12 as default format
-                stream_config.set_pixel_format(PIXEL_FORMAT_NV12)
+                // XXX temporarily use YUYV as default format
+                stream_config.set_pixel_format(PIXEL_FORMAT_YUYV)
             }
         };
 
