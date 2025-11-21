@@ -1,4 +1,4 @@
-use std::{sync::Arc, thread, time::{SystemTime, UNIX_EPOCH}};
+use std::{io, sync::Arc, thread, time::{SystemTime, UNIX_EPOCH}};
 use std::num::NonZeroU32;
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -39,6 +39,8 @@ struct LinuxCameraWorker {
     config: CameraConfiguration,
     cmd_rx: mpsc::Receiver<CameraCmd>,
     cmd_response_tx: mpsc::Sender<CameraCmdResponse>,
+
+    config_applied: bool,
 }
 
 // Safety: the `ActiveCamera` is only used by the worker thread
@@ -63,6 +65,13 @@ impl LinuxCameraWorker {
                         if running {
                             let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed("Already running".into())));
                             continue
+                        }
+
+                        if !instance.config_applied {
+                            if let Err(e) = Self::validate_and_configure(&mut instance) {
+                                let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed(format!("Configuration failed. error: {:?}", e).into())));
+                                continue
+                            }
                         }
 
                         let handler = instance.output_handler.clone();
@@ -218,14 +227,7 @@ impl LinuxCameraWorker {
                         drop(stream_config);
 
                         // avoid borrow checker issues by taking the config
-                        let configuration_result = {
-                            instance.config.validate();
-                            let result = instance.camera.configure(&mut instance.config);
-
-                            // XXX
-                            println!("config: {:?}", instance.config);
-                            result
-                        };
+                        let configuration_result = Self::validate_and_configure(&mut instance);
                         if let Err(e) = configuration_result {
                             if instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::SetFailed(format!("{e:?}")))).is_err() {
                                 shutdown = true;
@@ -260,6 +262,17 @@ impl LinuxCameraWorker {
                 }
             }
         }
+    }
+
+    fn validate_and_configure(mut instance: &mut LinuxCameraWorker) -> io::Result<()> {
+        instance.config.validate();
+        let result = instance.camera.configure(&mut instance.config);
+
+        // XXX
+        println!("config: {:?}", instance.config);
+
+        instance.config_applied = true;
+        result
     }
 }
 
@@ -309,6 +322,7 @@ impl LinuxCameraDevice {
             output_handler: None,
             cmd_rx,
             cmd_response_tx,
+            config_applied: false,
         };
 
         let worker_join_handle = thread::spawn(move || { LinuxCameraWorker::run(worker)});
