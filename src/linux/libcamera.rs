@@ -36,7 +36,7 @@ struct LinuxCameraWorker {
     camera: ActiveCamera<'static>,
     alloc: FrameBufferAllocator,
     output_handler: Option<OutputHandlerArc>,
-    config: Option<CameraConfiguration>,
+    config: CameraConfiguration,
     cmd_rx: mpsc::Receiver<CameraCmd>,
     cmd_response_tx: mpsc::Sender<CameraCmdResponse>,
 }
@@ -67,7 +67,6 @@ impl LinuxCameraWorker {
 
                         let handler = instance.output_handler.clone();
                         let stream_cfg = instance.config
-                            .as_mut().unwrap()
                             .get_mut(0).unwrap();
 
                         let stream = stream_cfg.stream().unwrap();
@@ -172,7 +171,6 @@ impl LinuxCameraWorker {
                     }
                     CameraCmd::Configure(options) => {
                         let mut stream_config = instance.config
-                            .as_mut().unwrap()
                             .get_mut(0).unwrap();
 
                         // TODO match the options against a valid format for this device, since the supplied values may be wrong or result in an invalid combination.
@@ -220,14 +218,11 @@ impl LinuxCameraWorker {
 
                         // avoid borrow checker issues by taking the config
                         let configuration_result = {
-                            let mut config = instance.config.take().unwrap();
-                            config.validate();
-                            let result = instance.camera.configure(&mut config);
+                            instance.config.validate();
+                            let result = instance.camera.configure(&mut instance.config);
 
                             // XXX
-                            println!("config: {:?}", config);
-
-                            instance.config.replace(config);
+                            println!("config: {:?}", instance.config);
                             result
                         };
                         if let Err(e) = configuration_result {
@@ -240,7 +235,6 @@ impl LinuxCameraWorker {
 
                         if let Some(desired_size) = desired_size {
                             let stream_config = instance.config
-                                .as_mut().unwrap()
                                 .get_mut(0).unwrap();
                             let actual_size = stream_config.get_size();
                             assert_eq!((desired_size.width, desired_size.height), (actual_size.width, actual_size.height));
@@ -309,7 +303,7 @@ impl LinuxCameraDevice {
 
         let worker = LinuxCameraWorker {
             camera,
-            config: Some(config),
+            config,
             alloc,
             output_handler: None,
             cmd_rx,
