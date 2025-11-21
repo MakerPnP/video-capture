@@ -284,7 +284,7 @@ struct LinuxCameraWorkerHandle {
 pub struct LinuxCameraDevice {
     id: String,
     running: bool,
-    worker_handle: LinuxCameraWorkerHandle,
+    worker_handle: Option<LinuxCameraWorkerHandle>,
     cmd_tx: mpsc::Sender<CameraCmd>,
     cmd_response_rx: mpsc::Receiver<CameraCmdResponse>,
 }
@@ -315,7 +315,7 @@ impl LinuxCameraDevice {
         Self {
             id,
             running: false,
-            worker_handle: LinuxCameraWorkerHandle { join: worker_join_handle },
+            worker_handle: Some(LinuxCameraWorkerHandle { join: worker_join_handle }),
             cmd_tx,
             cmd_response_rx,
         }
@@ -344,8 +344,14 @@ impl Device for LinuxCameraDevice {
     }
 
     fn stop(&mut self) -> Result<(), DeviceError> {
-        // TODO send stop command
-        Ok(())
+        self.cmd_tx.send(CameraCmd::Stop)
+            .map_err(|e| DeviceError::CloseFailed(format!("Failed to send close command: {:?}", e)))?;
+        match self.cmd_response_rx.recv()
+            .map_err(|e| DeviceError::StartFailed(format!("No response to command: {:?}", e)))?
+        {
+            CameraCmdResponse::Ok => Ok(()),
+            CameraCmdResponse::DeviceError(e) => Err(e),
+        }
     }
 
     fn configure(&mut self, options: Variant) -> Result<(), DeviceError> {
@@ -371,6 +377,16 @@ impl Device for LinuxCameraDevice {
     fn formats(&self) -> Result<Variant, DeviceError> {
         // Not implemented yet
         Ok(Variant::None)
+    }
+}
+
+impl Drop for LinuxCameraDevice {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(CameraCmd::Shutdown);
+
+        let handle = self.worker_handle.take().unwrap();
+
+        let _ = handle.join.join();
     }
 }
 
