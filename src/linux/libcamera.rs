@@ -1,3 +1,4 @@
+use libcamera::controls::ControlId;
 use std::{io, sync::Arc, thread, time::{SystemTime, UNIX_EPOCH}};
 use std::num::NonZeroU32;
 use std::sync::mpsc;
@@ -10,7 +11,8 @@ use libcamera::{
     request::ReuseFlag,
     stream::StreamRole,
 };
-use libcamera::camera::CameraConfiguration;
+use libcamera::camera::{Camera, CameraConfiguration};
+use libcamera::control_value::ControlValue;
 use libcamera::framebuffer::AsFrameBuffer;
 use libcamera::framebuffer_allocator::FrameBuffer;
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
@@ -25,15 +27,18 @@ use crate::{
 const PIXEL_FORMAT_MJPEG: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_MJPEG, 0);
 const PIXEL_FORMAT_NV12: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_NV12, 0);
 const PIXEL_FORMAT_YUYV: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_YUYV, 0);
+const PIXEL_FORMAT_YU12: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_YU12, 0);
 const FOURCC_MJPEG: u32 = u32::from_le_bytes([b'M', b'J', b'P', b'G']);
 const FOURCC_NV12: u32 = u32::from_le_bytes([b'N', b'V', b'1', b'2']);
 const FOURCC_YUYV: u32 = u32::from_le_bytes([b'Y', b'U', b'Y', b'V']);
+const FOURCC_YU12: u32 = u32::from_le_bytes([b'Y', b'U', b'1', b'2']);
 
 type OutputHanderFn = dyn Fn(MediaFrame) -> Result<(), DeviceError> + Send + Sync;
 type OutputHandlerArc = Arc<OutputHanderFn>;
 
 struct LinuxCameraWorker {
-    camera: ActiveCamera<'static>,
+    pending_camera: Camera<'static>,
+    camera: Option<ActiveCamera<'static>>,
     alloc: FrameBufferAllocator,
     output_handler: Option<OutputHandlerArc>,
     config: CameraConfiguration,
@@ -61,11 +66,87 @@ impl LinuxCameraWorker {
                 }
 
                 match cmd {
+                    CameraCmd::GetFormats => {
+                        let config = instance.pending_camera.generate_configuration(&[StreamRole::ViewFinder]).unwrap();
+                        let view_finder_config = config.get(0).unwrap();
+                        let camera_formats = view_finder_config.formats();
+                        println!("formats: {:?}", camera_formats);
+
+                        let controls: &libcamera::control::ControlInfoMap = instance.pending_camera.controls();
+
+                        let Ok(frame_duration_limits) = controls.find(ControlId::FrameDurationLimits.into()) else {
+                            let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::GetFailed("No 'frame duration limits' control".into())));
+                            continue
+                        };
+
+                        println!("Frame Duration. Min: {:?}, Max: {:?}, Default: {:?}",
+                            frame_duration_limits.min(),
+                            frame_duration_limits.max(),
+                            frame_duration_limits.def(),
+                        );
+
+                        // there really must be a better way of doing this...
+                        let (min, max, default) = match (frame_duration_limits.min(), frame_duration_limits.max(), frame_duration_limits.def()) {
+                            (ControlValue::Int64(min), ControlValue::Int64(max), ControlValue::Int64(default)) => (min[0], max[0], default[0]),
+                            _ => {
+                                let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::GetFailed("Unexpected types for frame duration limits".into())));
+                                continue
+                            }
+                        };
+                        let (fps_min, fps_max, fps_default) = (
+                            1_000_000_f64 / max as f64, // fps min = max interval
+                            1_000_000_f64 / min as f64, // fps max = min interval
+                            1_000_000_f64 / default as f64,
+                        );
+
+                        // now, since there is no ACTUAL fps (like you get with a USB camera) but a range instead, we have to invent some...
+                        let mut frame_rates = vec![fps_min, fps_max, fps_default];
+                        frame_rates.dedup();
+
+                        let mut formats = Variant::new_array();
+                        for pixel_format in camera_formats.pixel_formats().into_iter() {
+
+                            let video_format = match pixel_format.fourcc() {
+                                FOURCC_MJPEG => VideoFormat::Compression(CompressionFormat::MJPEG),
+                                FOURCC_YUYV => VideoFormat::Pixel(PixelFormat::YUYV),
+                                FOURCC_YU12 => VideoFormat::Pixel(PixelFormat::YV12),
+                                FOURCC_NV12 => VideoFormat::Pixel(PixelFormat::NV12),
+                                _ => {
+                                    // TODO support more formats
+                                    continue
+                                }
+                            };
+
+                            for size in camera_formats.sizes(pixel_format).into_iter() {
+                                let mut format = Variant::new_dict();
+                                format["format"] = (Into::<u32>::into(video_format)).into();
+                                format["width"] = size.width.into();
+                                format["height"] = size.height.into();
+
+                                format["frame-rates"] = frame_rates.iter().map(|frame_rate| Variant::from(frame_rate.clone())).collect();
+                                formats.array_add(format);
+                            }
+                        }
+
+                        let _ = instance.cmd_response_tx.send(CameraCmdResponse::Formats(formats));
+                    }
                     CameraCmd::Start => {
                         if running {
                             let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed("Already running".into())));
                             continue
                         }
+
+                        let active_camera = match instance.pending_camera.acquire() {
+                            Ok(camera) => camera,
+                            Err(e) => {
+                                let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed(format!("Acqurie failed. error: {:?}", e).into())));
+                                continue
+                            }
+                        };
+
+                        let active_camera: ActiveCamera<'static> = unsafe { std::mem::transmute(active_camera) };
+
+                        instance.camera = Some(active_camera);
 
                         if !instance.config_applied {
                             if let Err(e) = Self::validate_and_configure(&mut instance) {
@@ -74,6 +155,7 @@ impl LinuxCameraWorker {
                             }
                         }
 
+                        let camera = instance.camera.as_mut().unwrap();
                         let handler = instance.output_handler.clone();
                         let stream_cfg = instance.config
                             .get_mut(0).unwrap();
@@ -84,6 +166,7 @@ impl LinuxCameraWorker {
                         let format: libcamera::pixel_format::PixelFormat = stream_cfg.get_pixel_format();
                         let pixel_format = match format.fourcc() {
                             FOURCC_NV12 => crate::media::video::PixelFormat::NV12,
+                            FOURCC_YU12 => crate::media::video::PixelFormat::YV12,
                             FOURCC_YUYV => crate::media::video::PixelFormat::YUYV,
                             _ => {
                                 let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed(format!("Unsupported pixel format. {:?}", format).into())));
@@ -102,7 +185,7 @@ impl LinuxCameraWorker {
 
                         if let Some(handler) = handler {
                             // Set callback for completed requests
-                            instance.camera.on_request_completed({
+                            camera.on_request_completed({
                                 let desc = desc.clone();
                                 move |req| {
                                     if let Some(framebuffer) = req.buffer::<MemoryMappedFrameBuffer<FrameBuffer>>(&stream) {
@@ -115,10 +198,12 @@ impl LinuxCameraWorker {
                                                 .unwrap()
                                                 .as_micros() as u64;
 
-                                            let mut frame = MediaFrame::from_data_buffer(desc.clone(), data.as_slice()).unwrap();
-                                            frame.timestamp = timestamp;
+                                            // do it conditionally to avoid configuration mismatches, shouldn't really be needed.
+                                            if let Ok(mut frame) = MediaFrame::from_data_buffer(desc.clone(), data.as_slice()) {
+                                                frame.timestamp = timestamp;
 
-                                            let _ = handler(frame);
+                                                let _ = handler(frame);
+                                            }
                                         }
                                     }
 
@@ -139,13 +224,13 @@ impl LinuxCameraWorker {
                             .into_iter()
                             .enumerate()
                             .map(|(i, buf)| {
-                                let mut req = instance.camera.create_request(Some(i as u64)).unwrap();
+                                let mut req = camera.create_request(Some(i as u64)).unwrap();
                                 req.add_buffer(&stream, buf).unwrap();
                                 req
                             })
                             .collect::<Vec<_>>();
 
-                        if let Err(e) = instance.camera.start(None) {
+                        if let Err(e) = camera.start(None) {
                             let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed(format!("{e:?}"))));
                             continue;
                         };
@@ -153,23 +238,28 @@ impl LinuxCameraWorker {
                         // Enqueue all requests to the camera
                         for req in reqs {
                             println!("Request queued for execution: {req:#?}");
-                            instance.camera.queue_request(req).unwrap();
+                            camera.queue_request(req).unwrap();
                         }
 
-                        let _ = instance.cmd_response_tx.send(CameraCmdResponse::Ok);
                         running = true;
+
+                        let _ = instance.cmd_response_tx.send(CameraCmdResponse::Ok);
                     }
                     CameraCmd::Stop => {
-                        if !running {
+                        let Some(mut camera) = instance.camera.take() else {
                             let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::NotRunning("Not running".to_string())));
                             continue;
-                        }
+                        };
 
-                        if let Err(e) = instance.camera.stop() {
+                        if let Err(e) = camera.stop() {
                             let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StopFailed(format!("{e:?}"))));
                         }
-                        let _ = instance.cmd_response_tx.send(CameraCmdResponse::Ok);
+
+                        // active camera dropped at end of scope
+                        // TODO do we need to release it?
+
                         running = false;
+                        let _ = instance.cmd_response_tx.send(CameraCmdResponse::Ok);
                     }
                     CameraCmd::Shutdown => {
                         shutdown = true;
@@ -207,6 +297,8 @@ impl LinuxCameraWorker {
                         match video_format {
                             Some(VideoFormat::Pixel(PixelFormat::NV12)) => stream_config.set_pixel_format(PIXEL_FORMAT_NV12),
                             Some(VideoFormat::Pixel(PixelFormat::YUYV)) => stream_config.set_pixel_format(PIXEL_FORMAT_YUYV),
+                            // YV12 == YU12 ?
+                            Some(VideoFormat::Pixel(PixelFormat::YV12)) => stream_config.set_pixel_format(PIXEL_FORMAT_YU12),
                             Some(VideoFormat::Compression(CompressionFormat::MJPEG)) => stream_config.set_pixel_format(PIXEL_FORMAT_MJPEG),
                             Some(_) => {
                                 // TODO: handle other formats
@@ -226,15 +318,7 @@ impl LinuxCameraWorker {
                         // drop the reference to avoid borrow checker issues
                         drop(stream_config);
 
-                        // avoid borrow checker issues by taking the config
-                        let configuration_result = Self::validate_and_configure(&mut instance);
-                        if let Err(e) = configuration_result {
-                            if instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::SetFailed(format!("{e:?}")))).is_err() {
-                                shutdown = true;
-                            }
-                            break
-                        }
-
+                        // we can't actually apply the configuration until the camera is acquired
 
                         if let Some(desired_size) = desired_size {
                             let stream_config = instance.config
@@ -250,9 +334,9 @@ impl LinuxCameraWorker {
             }
             if let Some(req_rx) = req_rx.as_mut() {
                 if let Ok(mut req) = req_rx.recv_timeout(Duration::from_millis(250)) {
-                    if running {
+                    if let Some(ref camera) = instance.camera {
                         req.reuse(ReuseFlag::REUSE_BUFFERS);
-                        if let Err(e) = instance.camera.queue_request(req) {
+                        if let Err(e) = camera.queue_request(req) {
                             eprintln!("queue_request failed: {:?}", e);
                             break;
                         }
@@ -264,9 +348,9 @@ impl LinuxCameraWorker {
         }
     }
 
-    fn validate_and_configure(mut instance: &mut LinuxCameraWorker) -> io::Result<()> {
+    fn validate_and_configure(instance: &mut LinuxCameraWorker) -> io::Result<()> {
         instance.config.validate();
-        let result = instance.camera.configure(&mut instance.config);
+        let result = instance.camera.as_mut().unwrap().configure(&mut instance.config);
 
         // XXX
         println!("config: {:?}", instance.config);
@@ -283,11 +367,13 @@ enum CameraCmd
     Shutdown,
     SetOutputHandler(OutputHandlerArc),
     Configure(Variant),
+    GetFormats,
 }
 
 enum CameraCmdResponse {
     Ok,
     DeviceError(DeviceError),
+    Formats(Variant),
 }
 
 struct LinuxCameraWorkerHandle {
@@ -305,7 +391,7 @@ pub struct LinuxCameraDevice {
 
 impl LinuxCameraDevice {
     pub fn new(
-        camera: ActiveCamera<'static>
+        camera: Camera<'static>
     ) -> Self {
         let id = camera.id().to_string();
 
@@ -316,7 +402,8 @@ impl LinuxCameraDevice {
         let alloc = FrameBufferAllocator::new(&camera);
 
         let worker = LinuxCameraWorker {
-            camera,
+            pending_camera: camera,
+            camera: None,
             config,
             alloc,
             output_handler: None,
@@ -355,6 +442,7 @@ impl Device for LinuxCameraDevice {
         {
             CameraCmdResponse::Ok => Ok(()),
             CameraCmdResponse::DeviceError(e) => Err(e),
+            _ => unreachable!(),
         }
     }
 
@@ -366,6 +454,7 @@ impl Device for LinuxCameraDevice {
         {
             CameraCmdResponse::Ok => Ok(()),
             CameraCmdResponse::DeviceError(e) => Err(e),
+            _ => unreachable!(),
         }
     }
 
@@ -377,6 +466,7 @@ impl Device for LinuxCameraDevice {
         {
             CameraCmdResponse::Ok => Ok(()),
             CameraCmdResponse::DeviceError(e) => Err(e),
+            _ => unreachable!(),
         }
     }
 
@@ -390,8 +480,15 @@ impl Device for LinuxCameraDevice {
     }
 
     fn formats(&self) -> Result<Variant, DeviceError> {
-        // Not implemented yet
-        Ok(Variant::None)
+        self.cmd_tx.send(CameraCmd::GetFormats)
+            .map_err(|e| DeviceError::SetFailed(format!("Failed to send configure command: {:?}", e)))?;
+        match self.cmd_response_rx.recv()
+            .map_err(|e| DeviceError::SetFailed(format!("No response to command: {:?}", e)))?
+        {
+            CameraCmdResponse::DeviceError(e) => Err(e),
+            CameraCmdResponse::Formats(v) => Ok(v),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -417,6 +514,7 @@ impl<'a> OutputDevice for LinuxCameraDevice {
         {
             CameraCmdResponse::Ok => Ok(()),
             CameraCmdResponse::DeviceError(e) => Err(e),
+            _ => unreachable!(),
         }
     }
 }
@@ -475,8 +573,7 @@ impl DeviceManager for LinuxCameraManager {
         let cameras = self.mgr.cameras();
         for i in 0..cameras.len() {
             if let Some(cam) = cameras.get(i) {
-                let cam = cam.acquire().map_err(|e| DeviceError::OpenFailed(format!("{e:?}")))?;
-                let cam: ActiveCamera<'static> = unsafe { std::mem::transmute(cam) };
+                let cam: Camera<'static> = unsafe { std::mem::transmute(cam) };
 
                 let dev = LinuxCameraDevice::new(cam);
                 self.devices.push(dev);
@@ -492,6 +589,16 @@ impl DeviceManager for LinuxCameraManager {
     {
         self.change_handler = Some(Arc::new(handler));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::backend::libcamera::FOURCC_YU12;
+
+    #[test]
+    pub fn fourcc() {
+        assert_eq!(FOURCC_YU12, 0x32315559);
     }
 }
 
