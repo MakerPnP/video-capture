@@ -159,6 +159,7 @@ impl LinuxCameraWorker {
                         if let Err(e) = instance.camera.stop() {
                             let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StopFailed(format!("{e:?}"))));
                         }
+                        let _ = instance.cmd_response_tx.send(CameraCmdResponse::Ok);
                         running = false;
                     }
                     CameraCmd::Shutdown => {
