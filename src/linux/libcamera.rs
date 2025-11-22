@@ -16,19 +16,18 @@ use libcamera::control_value::ControlValue;
 use libcamera::framebuffer::AsFrameBuffer;
 use libcamera::framebuffer_allocator::FrameBuffer;
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
+use libcamera::properties::Model;
 use media::media_frame::MediaFrame;
-use media::video::{CompressionFormat, PixelFormat, VideoFormat, VideoFrameDescription};
+use media::video::{PixelFormat, VideoFormat, VideoFrameDescription};
 use crate::{
     device::{Device, DeviceEvent, OutputDevice, DeviceManager},
     error::DeviceError,
     variant::Variant,
 };
 
-const PIXEL_FORMAT_MJPEG: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_MJPEG, 0);
 const PIXEL_FORMAT_NV12: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_NV12, 0);
 const PIXEL_FORMAT_YUYV: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_YUYV, 0);
 const PIXEL_FORMAT_YU12: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_YU12, 0);
-const FOURCC_MJPEG: u32 = u32::from_le_bytes([b'M', b'J', b'P', b'G']);
 const FOURCC_NV12: u32 = u32::from_le_bytes([b'N', b'V', b'1', b'2']);
 const FOURCC_YUYV: u32 = u32::from_le_bytes([b'Y', b'U', b'Y', b'V']);
 const FOURCC_YU12: u32 = u32::from_le_bytes([b'Y', b'U', b'1', b'2']);
@@ -107,12 +106,11 @@ impl LinuxCameraWorker {
                         for pixel_format in camera_formats.pixel_formats().into_iter() {
 
                             let video_format = match pixel_format.fourcc() {
-                                FOURCC_MJPEG => VideoFormat::Compression(CompressionFormat::MJPEG),
                                 FOURCC_YUYV => VideoFormat::Pixel(PixelFormat::YUYV),
                                 FOURCC_YU12 => VideoFormat::Pixel(PixelFormat::YV12),
                                 FOURCC_NV12 => VideoFormat::Pixel(PixelFormat::NV12),
                                 _ => {
-                                    // TODO support more formats
+                                    // TODO support more formats (Contribution/PR's welcomed)
                                     continue
                                 }
                             };
@@ -164,11 +162,14 @@ impl LinuxCameraWorker {
 
                         let size = stream_cfg.get_size();
                         let format: libcamera::pixel_format::PixelFormat = stream_cfg.get_pixel_format();
+
+                        // TODO support more formats (Contribution/PR's welcomed)
                         let pixel_format = match format.fourcc() {
                             FOURCC_NV12 => crate::media::video::PixelFormat::NV12,
                             FOURCC_YU12 => crate::media::video::PixelFormat::YV12,
                             FOURCC_YUYV => crate::media::video::PixelFormat::YUYV,
                             _ => {
+
                                 let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed(format!("Unsupported pixel format. {:?}", format).into())));
                                 continue;
                             },
@@ -298,10 +299,8 @@ impl LinuxCameraWorker {
                             Some(VideoFormat::Pixel(PixelFormat::YUYV)) => stream_config.set_pixel_format(PIXEL_FORMAT_YUYV),
                             // YV12 == YU12 ?
                             Some(VideoFormat::Pixel(PixelFormat::YV12)) => stream_config.set_pixel_format(PIXEL_FORMAT_YU12),
-                            Some(VideoFormat::Compression(CompressionFormat::MJPEG)) => stream_config.set_pixel_format(PIXEL_FORMAT_MJPEG),
                             Some(_) => {
-                                // TODO: handle other formats
-                                unimplemented!()
+                                let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::SetFailed(format!("Unsupported format. '{:?}'", video_format))));
                             },
                             None => {
                                 // XXX temporarily use YUYV as default format
@@ -382,6 +381,7 @@ struct LinuxCameraWorkerHandle {
 /// Linux backend device
 pub struct LinuxCameraDevice {
     id: String,
+    name: String,
     running: bool,
     worker_handle: Option<LinuxCameraWorkerHandle>,
     cmd_tx: mpsc::Sender<CameraCmd>,
@@ -393,6 +393,7 @@ impl LinuxCameraDevice {
         camera: Camera<'static>
     ) -> Self {
         let id = camera.id().to_string();
+        let name = camera.properties().get::<Model>().unwrap_or(Model("N/A".to_string())).to_string();
 
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CameraCmd>();
         let (cmd_response_tx, cmd_response_rx) = std::sync::mpsc::channel::<CameraCmdResponse>();
@@ -415,6 +416,7 @@ impl LinuxCameraDevice {
 
         Self {
             id,
+            name,
             running: false,
             worker_handle: Some(LinuxCameraWorkerHandle { join: worker_join_handle }),
             cmd_tx,
@@ -425,8 +427,7 @@ impl LinuxCameraDevice {
 
 impl Device for LinuxCameraDevice {
     fn name(&self) -> &str {
-        //self.camera.properties().get::<Model>().unwrap()
-        "TODO"
+        &self.name
     }
 
     fn id(&self) -> &str {
