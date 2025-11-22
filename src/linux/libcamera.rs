@@ -255,8 +255,7 @@ impl LinuxCameraWorker {
                             let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StopFailed(format!("{e:?}"))));
                         }
 
-                        // active camera dropped at end of scope
-                        // TODO do we need to release it?
+                        // active camera dropped at end of scope (`ActiveCamera::Drop` impl releases it)
 
                         running = false;
                         let _ = instance.cmd_response_tx.send(CameraCmdResponse::Ok);
