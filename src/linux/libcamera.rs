@@ -1,3 +1,13 @@
+//! Linux support using libcamera.
+//!
+//! libcamera cameras are different to USB web cameras in that they expose a min/max/default frame rate
+//! range, instead of a fixed set of frame rates.  This is usually because the SoC to which a MIPI
+//! camera is connected to controls the rate at which it captures images, and the min/max are based
+//! on the image sensor's capabilities.
+//!
+//! See `variable-frame-durations` in the `formats` response.
+//!
+//! Original Author: Dominic Clifton <me@dominiclifton.name>
 use libcamera::controls::ControlId;
 use std::{io, sync::Arc, thread, time::{SystemTime, UNIX_EPOCH}};
 use std::num::NonZeroU32;
@@ -69,7 +79,6 @@ impl LinuxCameraWorker {
                         let config = instance.pending_camera.generate_configuration(&[StreamRole::ViewFinder]).unwrap();
                         let view_finder_config = config.get(0).unwrap();
                         let camera_formats = view_finder_config.formats();
-                        println!("formats: {:?}", camera_formats);
 
                         let controls: &libcamera::control::ControlInfoMap = instance.pending_camera.controls();
 
@@ -102,6 +111,11 @@ impl LinuxCameraWorker {
                         let mut frame_rates = vec![fps_min, fps_max, fps_default];
                         frame_rates.dedup();
 
+                        let mut variable_frame_durations = Variant::new_dict();
+                        variable_frame_durations["min"] = min.into();
+                        variable_frame_durations["max"] = max.into();
+                        variable_frame_durations["default"] = default.into();
+
                         let mut formats = Variant::new_array();
                         for pixel_format in camera_formats.pixel_formats().into_iter() {
 
@@ -115,13 +129,20 @@ impl LinuxCameraWorker {
                                 }
                             };
 
-                            for size in camera_formats.sizes(pixel_format).into_iter() {
+                            let mut sizes = camera_formats.sizes(pixel_format).into_iter()
+                                .collect::<Vec<_>>();
+                            sizes.sort_by(|a,b|a.width.cmp(&b.width).then(a.height.cmp(&b.height)));
+
+                            for size in sizes {
                                 let mut format = Variant::new_dict();
                                 format["format"] = (Into::<u32>::into(video_format)).into();
                                 format["width"] = size.width.into();
                                 format["height"] = size.height.into();
 
                                 format["frame-rates"] = frame_rates.iter().map(|frame_rate| Variant::from(frame_rate.clone())).collect();
+
+                                format["variable-frame-durations"] = variable_frame_durations.clone().into();
+
                                 formats.array_add(format);
                             }
                         }
