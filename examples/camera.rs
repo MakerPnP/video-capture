@@ -24,7 +24,7 @@ fn main() {
     }
 
     // Get the first camera
-    let device = match cam_mgr.index_mut(0) {
+    let device = match cam_mgr.index_mut(1) {
         Some(device) => device,
         None => {
             println!("no camera found");
@@ -81,11 +81,13 @@ fn main() {
     if let Ok(formats) = formats {
         if let Some(iter) = formats.array_iter() {
             for format in iter {
+                println!("stream: {:?}", format["stream"]);
                 println!("format: {:?}", format["format"]);
                 println!("color-range: {:?}", format["color-range"]);
                 println!("width: {:?}", format["width"]);
                 println!("height: {:?}", format["height"]);
                 println!("frame-rates: {:?}", format["frame-rates"]);
+                println!("variable-frame-durations: {:?}", format["variable-frame-durations"]);
             }
         }
     }

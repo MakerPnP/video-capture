@@ -27,8 +27,9 @@ use libcamera::framebuffer::AsFrameBuffer;
 use libcamera::framebuffer_allocator::FrameBuffer;
 use libcamera::framebuffer_map::MemoryMappedFrameBuffer;
 use libcamera::properties::Model;
+use media::data::DataFrameDescription;
 use media::media_frame::MediaFrame;
-use media::video::{PixelFormat, VideoFormat, VideoFrameDescription};
+use media::video::{CompressionFormat, PixelFormat, VideoFormat, VideoFrameDescription};
 use crate::{
     device::{Device, DeviceEvent, OutputDevice, DeviceManager},
     error::DeviceError,
@@ -38,9 +39,11 @@ use crate::{
 const PIXEL_FORMAT_NV12: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_NV12, 0);
 const PIXEL_FORMAT_YUYV: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_YUYV, 0);
 const PIXEL_FORMAT_YU12: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_YU12, 0);
+const PIXEL_FORMAT_MJPG: libcamera::pixel_format::PixelFormat = libcamera::pixel_format::PixelFormat::new(FOURCC_MJPG, 0);
 const FOURCC_NV12: u32 = u32::from_le_bytes([b'N', b'V', b'1', b'2']);
 const FOURCC_YUYV: u32 = u32::from_le_bytes([b'Y', b'U', b'Y', b'V']);
 const FOURCC_YU12: u32 = u32::from_le_bytes([b'Y', b'U', b'1', b'2']);
+const FOURCC_MJPG: u32 = u32::from_le_bytes([b'M', b'J', b'P', b'G']);
 
 type OutputHanderFn = dyn Fn(MediaFrame) -> Result<(), DeviceError> + Send + Sync;
 type OutputHandlerArc = Arc<OutputHanderFn>;
@@ -77,8 +80,6 @@ impl LinuxCameraWorker {
                 match cmd {
                     CameraCmd::GetFormats => {
                         let config = instance.pending_camera.generate_configuration(&[StreamRole::ViewFinder]).unwrap();
-                        let view_finder_config = config.get(0).unwrap();
-                        let camera_formats = view_finder_config.formats();
 
                         let controls: &libcamera::control::ControlInfoMap = instance.pending_camera.controls();
 
@@ -88,9 +89,9 @@ impl LinuxCameraWorker {
                         };
 
                         println!("Frame Duration. Min: {:?}, Max: {:?}, Default: {:?}",
-                            frame_duration_limits.min(),
-                            frame_duration_limits.max(),
-                            frame_duration_limits.def(),
+                                 frame_duration_limits.min(),
+                                 frame_duration_limits.max(),
+                                 frame_duration_limits.def(),
                         );
 
                         // there really must be a better way of doing this...
@@ -117,35 +118,45 @@ impl LinuxCameraWorker {
                         variable_frame_durations["default"] = default.into();
 
                         let mut formats = Variant::new_array();
-                        for pixel_format in camera_formats.pixel_formats().into_iter() {
 
-                            let video_format = match pixel_format.fourcc() {
-                                FOURCC_YUYV => VideoFormat::Pixel(PixelFormat::YUYV),
-                                FOURCC_YU12 => VideoFormat::Pixel(PixelFormat::YV12),
-                                FOURCC_NV12 => VideoFormat::Pixel(PixelFormat::NV12),
-                                _ => {
-                                    // TODO support more formats (Contribution/PR's welcomed)
-                                    continue
+                        let stream_count = config.len();
+                        for stream_index in 0..stream_count {
+                            let view_finder_config = config.get(0).unwrap();
+                            let camera_formats = view_finder_config.formats();
+
+                            for pixel_format in camera_formats.pixel_formats().into_iter() {
+
+                                let video_format = match pixel_format.fourcc() {
+                                    FOURCC_YUYV => VideoFormat::Pixel(PixelFormat::YUYV),
+                                    FOURCC_YU12 => VideoFormat::Pixel(PixelFormat::YV12),
+                                    FOURCC_NV12 => VideoFormat::Pixel(PixelFormat::NV12),
+                                    FOURCC_MJPG => VideoFormat::Compression(CompressionFormat::MJPEG),
+                                    _ => {
+                                        // TODO support more formats (Contribution/PR's welcomed)
+                                        continue
+                                    }
+                                };
+
+                                let mut sizes = camera_formats.sizes(pixel_format).into_iter()
+                                    .collect::<Vec<_>>();
+                                sizes.sort_by(|a,b|a.width.cmp(&b.width).then(a.height.cmp(&b.height)));
+
+                                for size in sizes {
+                                    let mut format = Variant::new_dict();
+                                    format["stream"] = Into::<u32>::into(stream_index as u32).into();
+                                    format["format"] = Into::<u32>::into(video_format).into();
+                                    format["width"] = size.width.into();
+                                    format["height"] = size.height.into();
+
+                                    format["frame-rates"] = frame_rates.iter().map(|frame_rate| Variant::from(frame_rate.clone())).collect();
+
+                                    format["variable-frame-durations"] = variable_frame_durations.clone().into();
+
+                                    formats.array_add(format);
                                 }
-                            };
-
-                            let mut sizes = camera_formats.sizes(pixel_format).into_iter()
-                                .collect::<Vec<_>>();
-                            sizes.sort_by(|a,b|a.width.cmp(&b.width).then(a.height.cmp(&b.height)));
-
-                            for size in sizes {
-                                let mut format = Variant::new_dict();
-                                format["format"] = (Into::<u32>::into(video_format)).into();
-                                format["width"] = size.width.into();
-                                format["height"] = size.height.into();
-
-                                format["frame-rates"] = frame_rates.iter().map(|frame_rate| Variant::from(frame_rate.clone())).collect();
-
-                                format["variable-frame-durations"] = variable_frame_durations.clone().into();
-
-                                formats.array_add(format);
                             }
-                        }
+                        };
+
 
                         let _ = instance.cmd_response_tx.send(CameraCmdResponse::Formats(formats));
                     }
@@ -185,22 +196,42 @@ impl LinuxCameraWorker {
                         let format: libcamera::pixel_format::PixelFormat = stream_cfg.get_pixel_format();
 
                         // TODO support more formats (Contribution/PR's welcomed)
-                        let pixel_format = match format.fourcc() {
-                            FOURCC_NV12 => crate::media::video::PixelFormat::NV12,
-                            FOURCC_YU12 => crate::media::video::PixelFormat::YV12,
-                            FOURCC_YUYV => crate::media::video::PixelFormat::YUYV,
-                            _ => {
+                        let fourcc = format.fourcc();
+                        let pixel_format = fourcc_to_pixel_format(fourcc);
+                        let compression_format = fourcc_to_compression_format(fourcc);
+                        pub fn fourcc_to_pixel_format(fourcc: u32) -> Option<PixelFormat> {
+                            match fourcc {
+                                FOURCC_NV12 => Some(crate::media::video::PixelFormat::NV12),
+                                FOURCC_YU12 => Some(crate::media::video::PixelFormat::YV12),
+                                FOURCC_YUYV => Some(crate::media::video::PixelFormat::YUYV),
+                                _ => None
+                            }
+                        }
 
-                                let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed(format!("Unsupported pixel format. {:?}", format).into())));
-                                continue;
+                        pub fn fourcc_to_compression_format(fourcc: u32) -> Option<crate::media::video::CompressionFormat> {
+                            match fourcc {
+                                FOURCC_MJPG => Some(crate::media::video::CompressionFormat::MJPEG),
+                                _ => None
+                            }
+                        }
+
+                        let desc = match (pixel_format, compression_format) {
+                            (Some(pixel_format), _) => {
+                                VideoFrameDescription::new(
+                                    pixel_format,
+                                    unsafe { NonZeroU32::new_unchecked(size.width) },
+                                    unsafe { NonZeroU32::new_unchecked(size.height) },
+                                )
                             },
+                            (_, Some(compression_format)) => {
+                                DataFrameDescription::new()
+                            },
+                            _ => {
+                                let _ = instance.cmd_response_tx.send(CameraCmdResponse::DeviceError(DeviceError::StartFailed(format!("Unsupported format. {:?}", format).into())));
+                                continue;
+                            }
                         };
 
-                        let desc = VideoFrameDescription::new(
-                            pixel_format,
-                            unsafe { NonZeroU32::new_unchecked(size.width) },
-                            unsafe { NonZeroU32::new_unchecked(size.height) },
-                        );
 
                         let (req_tx, new_req_rx) = mpsc::channel::<libcamera::request::Request>();
                         req_rx = Some(new_req_rx);
