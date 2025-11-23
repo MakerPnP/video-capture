@@ -355,6 +355,10 @@ impl LinuxCameraWorker {
                 if let Ok(mut req) = req_rx.recv_timeout(Duration::from_millis(250)) {
                     if let Some(ref camera) = instance.camera {
                         req.reuse(ReuseFlag::REUSE_BUFFERS);
+
+                        // TODO queue the request based on the desired frame rate / frame duration, not immediately.
+                        thread::sleep(Duration::from_secs_f64(1.0 / 30.0));
+
                         if let Err(e) = camera.queue_request(req) {
                             eprintln!("queue_request failed: {:?}", e);
                             break;
